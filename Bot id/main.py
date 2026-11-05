@@ -1,0 +1,1543 @@
+import asyncio
+import random
+
+from bale import BaleClient, pb, events
+
+from config import (
+    BALE_ACCESS_TOKEN,
+    ADMIN_IDS,
+    USERNAME_LOCK_INTERVAL,
+
+    CHANNEL_1,
+    CHANNEL_2,
+    CHANNEL_3,
+    CHANNEL_4,
+    CHANNEL_5,
+    CHANNEL_6,
+    CHANNEL_7,
+    CHANNEL_8,
+    CHANNEL_9,
+    CHANNEL_10,
+)
+
+
+# ==========================================
+# رنگ‌ها
+# ==========================================
+
+RESET = "\033[0m"
+RED = "\033[91m"
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+BLUE = "\033[94m"
+CYAN = "\033[96m"
+BOLD = "\033[1m"
+
+
+# ==========================================
+# کانال‌های مقصد
+#
+# ترتیب کاملاً مهم است:
+# 1 -> 2 -> 3 -> 4 -> ...
+# ==========================================
+
+DESTINATION_CHANNELS = [
+    CHANNEL_1,
+    CHANNEL_2,
+    CHANNEL_3,
+    CHANNEL_4,
+    CHANNEL_5,
+    CHANNEL_6,
+    CHANNEL_7,
+    CHANNEL_8,
+    CHANNEL_9,
+    CHANNEL_10,
+]
+
+
+# ==========================================
+# قفل‌های فعال
+#
+# username ->
+# {
+#     task,
+#     channel_number,
+#     channel
+# }
+# ==========================================
+
+active_locks = {}
+
+
+# ==========================================
+# نمایش
+# ==========================================
+
+def show(color, text):
+
+    print(
+        f"{color}{text}{RESET}"
+    )
+
+
+# ==========================================
+# تمیز کردن username
+# ==========================================
+
+def clean_username(username):
+
+    username = str(
+        username
+    ).strip()
+
+    while username.startswith("@"):
+
+        username = username[1:]
+
+    return username.strip()
+
+
+# ==========================================
+# تبدیل به @username
+# ==========================================
+
+def format_username(username):
+
+    username = clean_username(
+        username
+    )
+
+    if not username:
+
+        return ""
+
+    return f"@{username}"
+
+
+# ==========================================
+# بررسی username معتبر
+# ==========================================
+
+def valid_username(username):
+
+    return bool(
+        clean_username(username)
+    )
+
+
+# ==========================================
+# تعداد کانال‌های تنظیم‌شده
+# ==========================================
+
+def get_valid_destination_count():
+
+    count = 0
+
+    for channel in DESTINATION_CHANNELS:
+
+        if channel is None:
+
+            continue
+
+        if not str(channel).strip():
+
+            continue
+
+        count += 1
+
+    return count
+
+
+# ==========================================
+# بررسی اینکه کانال در حال استفاده است
+#
+# اگر یک username در حال تلاش باشد،
+# آن کانال را برای username دیگری
+# انتخاب نمی‌کنیم.
+# ==========================================
+
+def is_channel_being_used(
+    channel_number,
+):
+
+    for data in active_locks.values():
+
+        if data["channel_number"] == channel_number:
+
+            task = data["task"]
+
+            if not task.done():
+
+                return True
+
+    return False
+
+
+# ==========================================
+# بررسی مستقیم username مقصد در بله
+#
+# منطق بسیار مهم:
+#
+# اگر get_entity(username) موفق شود:
+#
+#     username در بله وجود دارد
+#     => کانال مقصد آزاد است
+#
+# اگر get_entity خطا بدهد:
+#
+#     username در بله وجود ندارد
+#     => کانال مقصد پر است
+#
+# نکته:
+# دیگر info.username را بررسی نمی‌کنیم.
+# ==========================================
+
+async def destination_username_exists(
+    client,
+    channel,
+):
+
+    channel = str(
+        channel
+    ).strip()
+
+    if not channel:
+
+        return False
+
+    username = clean_username(
+        channel
+    )
+
+    if not username:
+
+        return False
+
+    lookup = f"@{username}"
+
+    try:
+
+        entity = await client.get_entity(
+            lookup
+        )
+
+        # فقط موفق شدن get_entity مهم است.
+        if entity is not None:
+
+            return True
+
+        return False
+
+    except Exception:
+
+        return False
+
+
+# ==========================================
+# پیدا کردن اولین مقصد آزاد
+#
+# ترتیب:
+#
+# 1
+# 2
+# 3
+# ...
+# 10
+#
+# مستقیم از بله بررسی می‌شود.
+# ==========================================
+
+async def find_free_destination(
+    client,
+):
+
+    for index, channel in enumerate(
+        DESTINATION_CHANNELS,
+        start=1,
+    ):
+
+        # ----------------------------------
+        # کانال تنظیم نشده
+        # ----------------------------------
+
+        if channel is None:
+
+            continue
+
+        channel = str(
+            channel
+        ).strip()
+
+        if not channel:
+
+            continue
+
+        # ----------------------------------
+        # اگر همین الان در حال تلاش است
+        # ----------------------------------
+
+        if is_channel_being_used(
+            index
+        ):
+
+            continue
+
+        # ----------------------------------
+        # بررسی مستقیم username در بله
+        # ----------------------------------
+
+        exists = await destination_username_exists(
+            client,
+            channel,
+        )
+
+        # ----------------------------------
+        # username وجود دارد
+        # پس این مقصد آزاد است.
+        # ----------------------------------
+
+        if exists:
+
+            return (
+                index,
+                channel,
+            )
+
+        # ----------------------------------
+        # username وجود ندارد
+        # پس مقصد پر است.
+        # می‌رویم بعدی.
+        # ----------------------------------
+
+    return (
+        None,
+        None,
+    )
+
+
+# ==========================================
+# وضعیت یک کانال
+#
+# خروجی:
+#
+# free
+# busy
+# unavailable
+# unset
+# ==========================================
+
+async def get_channel_status(
+    client,
+    channel_number,
+    channel,
+):
+
+    # ----------------------------------
+    # تنظیم نشده
+    # ----------------------------------
+
+    if channel is None:
+
+        return "unset"
+
+    channel = str(
+        channel
+    ).strip()
+
+    if not channel:
+
+        return "unset"
+
+    # ----------------------------------
+    # در حال تلاش
+    # ----------------------------------
+
+    if is_channel_being_used(
+        channel_number
+    ):
+
+        return "busy"
+
+    # ----------------------------------
+    # بررسی مستقیم در بله
+    # ----------------------------------
+
+    exists = await destination_username_exists(
+        client,
+        channel,
+    )
+
+    if exists:
+
+        return "free"
+
+    return "occupied"
+
+
+# ==========================================
+# پیدا کردن GroupPeer
+# ==========================================
+
+async def get_channel_group_peer(
+    client,
+    channel,
+):
+
+    info = await client.get_entity(
+        channel
+    )
+
+    if info is None:
+
+        raise ValueError(
+            "اطلاعات کانال پیدا نشد."
+        )
+
+    peer = getattr(
+        info,
+        "peer",
+        None
+    )
+
+    if peer is None:
+
+        raise ValueError(
+            "Peer کانال پیدا نشد."
+        )
+
+    group_id = getattr(
+        peer,
+        "id",
+        None
+    )
+
+    access_hash = getattr(
+        peer,
+        "access_hash",
+        None
+    )
+
+    if group_id is None:
+
+        raise ValueError(
+            "groupId کانال پیدا نشد."
+        )
+
+    if access_hash is None:
+
+        raise ValueError(
+            "accessHash کانال پیدا نشد."
+        )
+
+    group_peer = pb.GroupPeer(
+        groupId=int(
+            group_id
+        ),
+        accessHash=int(
+            access_hash
+        ),
+    )
+
+    return (
+        info,
+        group_peer,
+    )
+
+
+# ==========================================
+# تغییر username کانال
+# ==========================================
+
+async def change_channel_username(
+    client,
+    channel,
+    new_username,
+):
+
+    channel = str(
+        channel
+    ).strip()
+
+    new_username = clean_username(
+        new_username
+    )
+
+    if not channel:
+
+        raise ValueError(
+            "آیدی کانال خالی است."
+        )
+
+    if not new_username:
+
+        raise ValueError(
+            "username جدید خالی است."
+        )
+
+    info, group_peer = await get_channel_group_peer(
+        client,
+        channel,
+    )
+
+    random_id = random.randint(
+        1,
+        9223372036854775807
+    )
+
+    result = await client.groups.EditChannelNick(
+        groupPeer=group_peer,
+        nick=new_username,
+        randomId=random_id,
+    )
+
+    return result
+
+
+# ==========================================
+# بررسی اینکه username جدید روی کانال
+# قرار گرفته یا نه
+# ==========================================
+
+async def username_is_set(
+    client,
+    channel,
+    username,
+):
+
+    try:
+
+        info = await client.get_entity(
+            channel
+        )
+
+        current_username = clean_username(
+            getattr(
+                info,
+                "username",
+                ""
+            )
+        )
+
+        target_username = clean_username(
+            username
+        )
+
+        if not current_username:
+
+            return False
+
+        return (
+            current_username.lower()
+            ==
+            target_username.lower()
+        )
+
+    except Exception:
+
+        return False
+
+
+# ==========================================
+# ارسال پیام به PV ادمین
+# ==========================================
+
+async def send_admin_message(
+    client,
+    text,
+):
+
+    for admin_id in ADMIN_IDS:
+
+        try:
+
+            await client.send_message(
+                admin_id,
+                text,
+            )
+
+        except Exception as error:
+
+            show(
+                RED,
+                f"❌ خطا در ارسال پیام به ادمین {admin_id}: "
+                f"{type(error).__name__}: {error}"
+            )
+
+
+
+# ==========================================
+# ثبت موفقیت
+# ==========================================
+
+async def mark_lock_success(
+    client,
+    username,
+    channel_number,
+    channel,
+    attempt,
+):
+
+    key = username.lower()
+
+    # ----------------------------------
+    # قفل فعال حذف می‌شود
+    # ----------------------------------
+
+    active_locks.pop(
+        key,
+        None
+    )
+
+    # ----------------------------------
+    # پیام موفقیت
+    # ----------------------------------
+
+    await send_admin_message(
+        client,
+        f"🎉 قفل @{username} با موفقیت انجام شد!\n"
+        f"🔒 آیدی قفل شد: @{username}\n"
+        f"📌 کانال مقصد: {channel_number}\n"
+        f"📢 {channel}\n"
+        f"🔢 تعداد تلاش: {attempt}\n"
+        f"⛔ کانال {channel_number} تا زمانی که "
+        f"username مقصد آن دوباره آزاد نشود، "
+        f"انتخاب نمی‌شود."
+    )
+
+
+# ==========================================
+# حلقه تلاش
+# ==========================================
+
+async def username_lock_loop(
+    client,
+    username,
+    channel_number,
+    channel,
+):
+
+    username = clean_username(
+        username
+    )
+
+    key = username.lower()
+
+    attempt = 0
+
+    try:
+
+        # ----------------------------------
+        # پیام شروع
+        # ----------------------------------
+
+        await send_admin_message(
+            client,
+            f"🔒 قفل @{username} شروع شد.\n"
+            f"🎯 مقصد: کانال {channel_number}\n"
+            f"📢 {channel}\n"
+            f"⏱ هر {USERNAME_LOCK_INTERVAL} ثانیه یک تلاش."
+        )
+
+        # ----------------------------------
+        # حلقه تلاش
+        # ----------------------------------
+
+        while True:
+
+            attempt += 1
+
+            try:
+
+                # ----------------------------------
+                # تلاش واقعی
+                # ----------------------------------
+
+                await change_channel_username(
+                    client,
+                    channel,
+                    username,
+                )
+
+                # ----------------------------------
+                # فرصت Sync
+                # ----------------------------------
+
+                await asyncio.sleep(
+                    0.15
+                )
+
+                # ----------------------------------
+                # بررسی موفقیت
+                # ----------------------------------
+
+                success = await username_is_set(
+                    client,
+                    channel,
+                    username,
+                )
+
+                if success:
+
+                    await mark_lock_success(
+                        client,
+                        username,
+                        channel_number,
+                        channel,
+                        attempt,
+                    )
+
+                    break
+
+            except asyncio.CancelledError:
+
+                raise
+
+            except Exception:
+
+                # ----------------------------------
+                # ممکن است عملیات موفق شده باشد
+                # ولی RPC خطا داده باشد.
+                # ----------------------------------
+
+                try:
+
+                    success = await username_is_set(
+                        client,
+                        channel,
+                        username,
+                    )
+
+                    if success:
+
+                        await mark_lock_success(
+                            client,
+                            username,
+                            channel_number,
+                            channel,
+                            attempt,
+                        )
+
+                        break
+
+                except Exception:
+
+                    pass
+
+            # ----------------------------------
+            # فاصله تلاش بعدی
+            # ----------------------------------
+
+            await asyncio.sleep(
+                USERNAME_LOCK_INTERVAL
+            )
+
+    except asyncio.CancelledError:
+
+        await send_admin_message(
+            client,
+            f"🛑 قفل @{username} متوقف شد.\n"
+            f"📌 کانال {channel_number} دوباره قابل استفاده است."
+        )
+
+        raise
+
+    finally:
+
+        current = active_locks.get(
+            key
+        )
+
+        if current is not None:
+
+            if (
+                current["task"]
+                is asyncio.current_task()
+            ):
+
+                active_locks.pop(
+                    key,
+                    None
+                )
+
+
+# ==========================================
+# شروع قفل
+# ==========================================
+
+async def start_username_lock(
+    client,
+    username,
+):
+
+    username = clean_username(
+        username
+    )
+
+    if not valid_username(
+        username
+    ):
+
+        return (
+            False,
+            "❌ username نامعتبر است."
+        )
+
+    key = username.lower()
+
+    # ----------------------------------
+    # قفل تکراری
+    # ----------------------------------
+
+    old_lock = active_locks.get(
+        key
+    )
+
+    if old_lock is not None:
+
+        if not old_lock["task"].done():
+
+            return (
+                False,
+                f"⚠️ قفل @{username} "
+                f"از قبل فعال است."
+            )
+
+        active_locks.pop(
+            key,
+            None
+        )
+
+    # ----------------------------------
+    # پیدا کردن اولین کانال آزاد
+    #
+    # 1 -> 2 -> 3 -> ...
+    # ----------------------------------
+
+    channel_number, channel = await find_free_destination(
+        client
+    )
+
+    # ----------------------------------
+    # هیچ مقصد آزادی نیست
+    # ----------------------------------
+
+    if channel_number is None:
+
+        return (
+            False,
+            "❌ ظرفیت تمام کانال‌های مقصد پر است.\n"
+            "هیچ تلاشی انجام نشد.\n"
+            "📌 هیچ کانالی برای قفل جدید در دسترس نیست."
+        )
+
+    # ----------------------------------
+    # ساخت Task
+    # ----------------------------------
+
+    task = asyncio.create_task(
+        username_lock_loop(
+            client,
+            username,
+            channel_number,
+            channel,
+        )
+    )
+
+    # ----------------------------------
+    # ثبت قفل
+    # ----------------------------------
+
+    active_locks[key] = {
+        "task": task,
+        "channel_number": channel_number,
+        "channel": channel,
+    }
+
+    return (
+        True,
+        f"🔒 قفل @{username} فعال شد.\n"
+        f"🎯 مقصد انتخاب‌شده: کانال {channel_number}\n"
+        f"📢 {channel}\n"
+        f"⏱ هر {USERNAME_LOCK_INTERVAL} ثانیه یک تلاش."
+    )
+
+
+# ==========================================
+# توقف قفل
+# ==========================================
+
+async def stop_username_lock(
+    username,
+):
+
+    username = clean_username(
+        username
+    )
+
+    key = username.lower()
+
+    data = active_locks.get(
+        key
+    )
+
+    if data is None:
+
+        return (
+            False,
+            f"⚠️ قفل @{username} فعالی پیدا نشد."
+        )
+
+    task = data["task"]
+
+    channel_number = data[
+        "channel_number"
+    ]
+
+    if task.done():
+
+        active_locks.pop(
+            key,
+            None
+        )
+
+        return (
+            False,
+            f"⚠️ قفل @{username} دیگر فعال نیست."
+        )
+
+    # ----------------------------------
+    # لغو Task
+    # ----------------------------------
+
+    task.cancel()
+
+    try:
+
+        await task
+
+    except asyncio.CancelledError:
+
+        pass
+
+    # ----------------------------------
+    # حذف قطعی
+    # ----------------------------------
+
+    active_locks.pop(
+        key,
+        None
+    )
+
+    return (
+        True,
+        f"🛑 قفل @{username} متوقف شد.\n"
+        f"📌 کانال {channel_number} دوباره قابل بررسی است."
+    )
+
+
+# ==========================================
+# وضعیت
+# ==========================================
+
+async def get_status_text(
+    client,
+):
+
+    lines = [
+        "📊 وضعیت کانال‌های مقصد",
+        "",
+    ]
+
+    total = 0
+    free = 0
+    occupied = 0
+    busy = 0
+    unset = 0
+
+    # ==========================================
+    # بررسی دقیق و ترتیبی
+    #
+    # 1
+    # 2
+    # 3
+    # ...
+    # ==========================================
+
+    for index, channel in enumerate(
+        DESTINATION_CHANNELS,
+        start=1,
+    ):
+
+        # ----------------------------------
+        # تنظیم نشده
+        # ----------------------------------
+
+        if channel is None:
+
+            unset += 1
+
+            lines.append(
+                f"⚪ کانال {index} → تنظیم نشده"
+            )
+
+            continue
+
+        channel = str(
+            channel
+        ).strip()
+
+        if not channel:
+
+            unset += 1
+
+            lines.append(
+                f"⚪ کانال {index} → تنظیم نشده"
+            )
+
+            continue
+
+        total += 1
+
+        # ----------------------------------
+        # بررسی وضعیت واقعی
+        # ----------------------------------
+
+        status = await get_channel_status(
+            client,
+            index,
+            channel,
+        )
+
+        # ----------------------------------
+        # در حال تلاش
+        # ----------------------------------
+
+        if status == "busy":
+
+            busy += 1
+
+            lines.append(
+                f"🟡 کانال {index} → در حال تلاش | "
+                f"{format_username(channel)}"
+            )
+
+            continue
+
+        # ----------------------------------
+        # username مقصد وجود دارد
+        # پس آزاد است.
+        # ----------------------------------
+
+        if status == "free":
+
+            free += 1
+
+            lines.append(
+                f"🟢 کانال {index} → آزاد | "
+                f"{format_username(channel)}"
+            )
+
+            continue
+
+        # ----------------------------------
+        # username مقصد وجود ندارد
+        # پس پر است.
+        # ----------------------------------
+
+        occupied += 1
+
+        lines.append(
+            f"🔴 کانال {index} → پر | "
+            f"{format_username(channel)}"
+        )
+
+    # ==========================================
+    # آمار
+    # ==========================================
+
+    used = occupied + busy
+
+    lines.append("")
+
+    lines.append(
+        f"📦 ظرفیت استفاده‌شده: {used}/{total}"
+    )
+
+    lines.append(
+        f"🟢 آزاد: {free}"
+    )
+
+    lines.append(
+        f"🔴 پر: {occupied}"
+    )
+
+    lines.append(
+        f"🟡 در حال تلاش: {busy}"
+    )
+
+    return "\n".join(
+        lines
+    )
+
+
+# ==========================================
+# پردازش پیام PV
+# ==========================================
+
+async def handle_private_message(
+    client,
+    event,
+):
+
+    # ==========================================
+    # فقط PV
+    # ==========================================
+
+    if not getattr(
+        event,
+        "is_private",
+        False
+    ):
+
+        return
+
+    # ==========================================
+    # فقط ADMIN
+    # ==========================================
+
+    sender_id = getattr(
+        event,
+        "sender_id",
+        None
+    )
+
+    if sender_id not in ADMIN_IDS:
+
+        return
+
+    # ==========================================
+    # متن
+    # ==========================================
+
+    text = getattr(
+        event,
+        "text",
+        None
+    )
+
+    if not text:
+
+        return
+
+    text = str(
+        text
+    ).strip()
+
+    if not text:
+
+        return
+
+    parts = text.split()
+
+    # ==========================================
+    # قفل
+    # ==========================================
+
+    if (
+        len(parts) == 2
+        and parts[0] == "قفل"
+    ):
+
+        username = clean_username(
+            parts[1]
+        )
+
+        if not username:
+
+            await event.reply(
+                "❌ username وارد نشده."
+            )
+
+            return
+
+        started, message = await start_username_lock(
+            client,
+            username,
+        )
+
+        await event.reply(
+            message
+        )
+
+        return
+
+    # ==========================================
+    # توقف
+    # ==========================================
+
+    if (
+        len(parts) == 2
+        and parts[0] == "متوقف"
+    ):
+
+        username = clean_username(
+            parts[1]
+        )
+
+        if not username:
+
+            await event.reply(
+                "❌ username وارد نشده."
+            )
+
+            return
+
+        stopped, message = await stop_username_lock(
+            username
+        )
+
+        await event.reply(
+            message
+        )
+
+        return
+
+    # ==========================================
+    # وضعیت
+    # ==========================================
+
+    if text == "وضعیت":
+
+        message = await get_status_text(
+            client
+        )
+
+        await event.reply(
+            message
+        )
+
+        return
+
+
+# ==========================================
+# برنامه اصلی
+# ==========================================
+
+async def main():
+
+    # ==========================================
+    # بررسی Config
+    # ==========================================
+
+    if not BALE_ACCESS_TOKEN:
+
+        show(
+            RED,
+            "❌ BALE_ACCESS_TOKEN تنظیم نشده."
+        )
+
+        return
+
+    if not ADMIN_IDS:
+
+        show(
+            RED,
+            "❌ ADMIN_ID تنظیم نشده."
+        )
+
+        return
+
+    if USERNAME_LOCK_INTERVAL <= 0:
+
+        show(
+            RED,
+            "❌ USERNAME_LOCK_INTERVAL باید "
+            "بیشتر از صفر باشد."
+        )
+
+        return
+
+    # ==========================================
+    # تعداد کانال‌های تنظیم‌شده
+    # ==========================================
+
+    valid_channels = get_valid_destination_count()
+
+    if valid_channels == 0:
+
+        show(
+            RED,
+            "❌ هیچ کانال مقصدی در config.py تنظیم نشده."
+        )
+
+        return
+
+    # ==========================================
+    # Client
+    # ==========================================
+
+    client = BaleClient(
+        BALE_ACCESS_TOKEN
+    )
+
+    # ==========================================
+    # Header
+    # ==========================================
+
+    show(
+        CYAN,
+        BOLD
+        + "╔══════════════════════════════════╗"
+    )
+
+    show(
+        CYAN,
+        BOLD
+        + "║      BALE USERNAME LOCK         ║"
+    )
+
+    show(
+        CYAN,
+        BOLD
+        + "╚══════════════════════════════════╝"
+    )
+
+    print()
+
+    try:
+
+        # ==========================================
+        # اتصال
+        # ==========================================
+
+        show(
+            YELLOW,
+            "⏳ در حال اتصال به بله..."
+        )
+
+        await client.connect()
+
+        show(
+            GREEN,
+            "✅ اتصال برقرار شد!"
+        )
+
+        print()
+
+        # ==========================================
+        # اطلاعات اکانت
+        # ==========================================
+
+        try:
+
+            me = await client.get_me()
+
+            account_name = (
+                getattr(
+                    me,
+                    "title",
+                    None
+                )
+                or getattr(
+                    me,
+                    "name",
+                    None
+                )
+                or "نامشخص"
+            )
+
+            account_id = getattr(
+                me,
+                "id",
+                None
+            )
+
+            show(
+                CYAN,
+                f"👤 اکانت: {account_name}"
+            )
+
+            if account_id is not None:
+
+                show(
+                    CYAN,
+                    f"🆔 ID: {account_id}"
+                )
+
+        except Exception as error:
+
+            show(
+                YELLOW,
+                "⚠️ دریافت اطلاعات اکانت ناموفق بود: "
+                f"{type(error).__name__}: {error}"
+            )
+
+        print()
+
+        # ==========================================
+        # Event Handler
+        # ==========================================
+
+        @client.on(events.NewMessage)
+        async def on_new_message(event):
+
+            try:
+
+                await handle_private_message(
+                    client,
+                    event,
+                )
+
+            except Exception as error:
+
+                show(
+                    RED,
+                    "❌ خطا در پردازش پیام: "
+                    f"{type(error).__name__}: {error}"
+                )
+
+                try:
+
+                    if getattr(
+                        event,
+                        "sender_id",
+                        None
+                    ) in ADMIN_IDS:
+
+                        await event.reply(
+                            "❌ خطا در پردازش دستور:\n"
+                            f"{type(error).__name__}: {error}"
+                        )
+
+                except Exception:
+
+                    pass
+
+        # ==========================================
+        # آماده
+        # ==========================================
+
+        show(
+            GREEN,
+            "📩 دریافت پیام‌های PV فعال شد."
+        )
+
+        show(
+            GREEN,
+            "🔐 فقط مدیران ربات می‌توانند دستور بدهند."
+        )
+
+        show(
+            CYAN,
+            f"⏱ فاصله تلاش: "
+            f"{USERNAME_LOCK_INTERVAL} ثانیه"
+        )
+
+        show(
+            CYAN,
+            f"🎯 تعداد مقصدها: {valid_channels}"
+        )
+
+        print()
+
+        show(
+            BLUE,
+            "دستورات PV:"
+        )
+
+        show(
+            GREEN,
+            "قفل @username"
+        )
+
+        show(
+            YELLOW,
+            "متوقف @username"
+        )
+
+        show(
+            CYAN,
+            "وضعیت"
+        )
+
+        print()
+
+        # ==========================================
+        # اجرای دائمی
+        # ==========================================
+
+        await client.run_until_disconnected()
+
+    except KeyboardInterrupt:
+
+        show(
+            YELLOW,
+            "⏹ برنامه متوقف شد."
+        )
+
+    except Exception as error:
+
+        show(
+            RED,
+            "❌ خطای اصلی برنامه: "
+            f"{type(error).__name__}: {error}"
+        )
+
+    finally:
+
+        # ==========================================
+        # توقف همه Task ها
+        # ==========================================
+
+        tasks = []
+
+        for data in list(
+            active_locks.values()
+        ):
+
+            task = data["task"]
+
+            if not task.done():
+
+                task.cancel()
+
+                tasks.append(
+                    task
+                )
+
+        if tasks:
+
+            await asyncio.gather(
+                *tasks,
+                return_exceptions=True
+            )
+
+        active_locks.clear()
+
+        # ==========================================
+        # قطع اتصال
+        # ==========================================
+
+        try:
+
+            await client.disconnect()
+
+        except Exception:
+
+            pass
+
+        show(
+            CYAN,
+            "👋 برنامه بسته شد."
+        )
+
+
+# ==========================================
+# اجرا
+# ==========================================
+
+if __name__ == "__main__":
+
+    asyncio.run(
+        main()
+    )
